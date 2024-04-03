@@ -4,29 +4,31 @@
 import torch
 import triton
 import triton.language as tl
+import os
+os.environ["TRITON_INTERPRET"] = "1"
 
 if triton.__version__ >= "2.1.0":
 
-    @triton.jit
+    @triton.jit(interpret=True)
     def _fwd_kernel(
-        Q,
+        Q, # shape: [4, 40, 128]
         K,
         V,
-        K_cache,
-        V_cache,
-        B_Loc,
-        sm_scale,
-        B_Start_Loc,
-        B_Seqlen,
-        B_Ctxlen,
-        block_size,
-        x,
-        Out,
-        stride_b_loc_b,
-        stride_b_loc_s,
-        stride_qbs,
-        stride_qh,
-        stride_qd,
+        K_cache, # shape: [3734, 40, 16, 16, 8]
+        V_cache, 
+        B_Loc, # shape: [2, 47]
+        sm_scale, # 0.088
+        B_Start_Loc, # [0, 2]
+        B_Seqlen, # [754, 754]
+        B_Ctxlen, # [752, 752]
+        block_size, # 16
+        x, # 8
+        Out, # shape: [4, 40, 128]
+        stride_b_loc_b, # 47
+        stride_b_loc_s, # 1
+        stride_qbs, # 15360
+        stride_qh, # 128
+        stride_qd, # 1
         stride_kbs,
         stride_kh,
         stride_kd,
@@ -45,22 +47,22 @@ if triton.__version__ >= "2.1.0":
         stride_v_cache_h,
         stride_v_cache_d,
         stride_v_cache_bl,
-        num_queries_per_kv: int,
-        BLOCK_M: tl.constexpr,
-        BLOCK_DMODEL: tl.constexpr,
-        BLOCK_N: tl.constexpr,
+        num_queries_per_kv: int, # 1
+        BLOCK_M: tl.constexpr, # 128, 128tokens per cuda block to process
+        BLOCK_DMODEL: tl.constexpr, # 128
+        BLOCK_N: tl.constexpr, # 128
     ):
-        cur_batch = tl.program_id(0)
-        cur_head = tl.program_id(1)
-        start_m = tl.program_id(2)
+        cur_batch = tl.program_id(0) # 2, batch_id
+        cur_head = tl.program_id(1) # 40, head_id
+        start_m = tl.program_id(2) # 1, always 0 
 
-        cur_kv_head = cur_head // num_queries_per_kv
+        cur_kv_head = cur_head // num_queries_per_kv # head_id//1 = head_id
 
-        cur_batch_ctx_len = tl.load(B_Ctxlen + cur_batch)
-        cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
-        cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
+        cur_batch_ctx_len = tl.load(B_Ctxlen + cur_batch) # 752, prefix cache length
+        cur_batch_seq_len = tl.load(B_Seqlen + cur_batch) # 754
+        cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch) # 0
 
-        block_start_loc = BLOCK_M * start_m
+        block_start_loc = BLOCK_M * start_m # 0
 
         # initialize offsets
         offs_n = tl.arange(0, BLOCK_N)
@@ -73,7 +75,7 @@ if triton.__version__ >= "2.1.0":
         q = tl.load(
             Q + off_q,
             mask=offs_m[:, None] < cur_batch_seq_len - cur_batch_ctx_len,
-            other=0.0)
+            other=0.0) # (128, 128), first 2 rows acitvate
 
         # # initialize pointer to m and l
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -83,6 +85,7 @@ if triton.__version__ >= "2.1.0":
         for start_n in range(0, cur_batch_ctx_len, BLOCK_N):
             start_n = tl.multiple_of(start_n, BLOCK_N)
             # -- compute qk ----
+            ## block_number，即这128个token每个属于的logic block_id
             bn = tl.load(B_Loc + cur_batch * stride_b_loc_b +
                          ((start_n + offs_n) // block_size) * stride_b_loc_s,
                          mask=(start_n + offs_n) < cur_batch_ctx_len,
@@ -100,10 +103,10 @@ if triton.__version__ >= "2.1.0":
                 (start_n + offs_n[:, None]) % block_size * stride_v_cache_bl)
             k = tl.load(K_cache + off_k,
                         mask=(start_n + offs_n[None, :]) < cur_batch_ctx_len,
-                        other=0.0)
+                        other=0.0) # (128, 128)
 
             qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-            qk += tl.dot(q, k)
+            qk += tl.dot(q, k) # (2, 128) * (128, 128) = (2, 128)
             qk = tl.where((start_n + offs_n[None, :]) < cur_batch_ctx_len, qk,
                           float("-inf"))
             qk *= sm_scale
@@ -145,6 +148,9 @@ if triton.__version__ >= "2.1.0":
         block_mask = tl.where(
             block_start_loc < cur_batch_seq_len - cur_batch_ctx_len, 1, 0)
 
+        # 上面是对prefix的KV做一遍，下面是对增量的K再做一遍attention，为什么两部分不合在一起？
+        # 因为这部分是从新算出来的K和V里取的，而上面的是从KV Cache里取的，但这里的K和V不是已经存到KV Cache里了吗？
+        # 这可能跟前面提到的initial memory profiling run时KV Cache为空有关
         for start_n in range(0, block_mask * (start_m + 1) * BLOCK_M, BLOCK_N):
             start_n = tl.multiple_of(start_n, BLOCK_N)
             # -- compute qk ----

@@ -17,15 +17,15 @@ def test_prefix(llm=None, sampling_params=None, prompts=None):
 
 
 def main(args):
-    llm = LLM(model="baichuan-inc/Baichuan2-13B-Chat",
+    llm = LLM(model="/workdir/llm_models/llama2_13b_chat",
               tokenizer_mode='auto',
               trust_remote_code=True,
               enforce_eager=True,
               enable_prefix_caching=args.enable_prefix_caching)
 
-    num_prompts = 100
+    num_prompts = 3
     prompts = [PROMPT] * num_prompts
-    sampling_params = SamplingParams(temperature=0, max_tokens=100)
+    sampling_params = SamplingParams(best_of=1, temperature=0, max_tokens=100)
 
     print("------warm up------")
     test_prefix(
