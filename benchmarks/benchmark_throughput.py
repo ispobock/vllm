@@ -200,6 +200,31 @@ def run_mii(
     client.terminate_server()
     return end - start
 
+def run_lmdeploy(
+    requests: List[Tuple[str, int, int]],
+    model: str,
+    tensor_parallel_size: int
+) -> float:
+    from lmdeploy import GenerationConfig, TurbomindEngineConfig, pipeline
+    engine_config = TurbomindEngineConfig(
+        tp=tensor_parallel_size
+    )
+    llm = pipeline(model, backend_config=engine_config)
+
+    gen_configs = [
+        GenerationConfig(temperature=0.0,
+                            top_p=1.0,
+                            ignore_eos=True,
+                            max_new_tokens=output_len)
+        for _, _, output_len in requests
+    ]
+    prompts = [prompt for prompt, _, _ in requests]
+
+    start = time.perf_counter()
+    llm(prompts, gen_configs, do_preprocess=False, use_tqdm=True)
+    end = time.perf_counter()
+    return end - start
+
 
 def main(args: argparse.Namespace):
     print(args)
@@ -235,6 +260,8 @@ def main(args: argparse.Namespace):
     elif args.backend == "mii":
         elapsed_time = run_mii(requests, args.model, args.tensor_parallel_size,
                                args.output_len)
+    elif args.backend == "lmdeploy":
+        elapsed_time = run_lmdeploy(requests, args.model, args.tensor_parallel_size)
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
     total_num_tokens = sum(prompt_len + output_len
@@ -259,7 +286,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark the throughput.")
     parser.add_argument("--backend",
                         type=str,
-                        choices=["vllm", "hf", "mii"],
+                        choices=["vllm", "hf", "mii", "lmdeploy"],
                         default="vllm")
     parser.add_argument("--dataset",
                         type=str,
